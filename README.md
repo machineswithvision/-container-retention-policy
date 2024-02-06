@@ -57,7 +57,7 @@ name: Delete old container images
 
 on:
   schedule:
-    - cron: "0 0 1 * *"  # every day at midnight
+    - cron: "0 0 * * *"  # every day at midnight
 
 
 jobs:
@@ -146,6 +146,31 @@ jobs:
           token: ${{ secrets.PAT }}
 ```
 
+An example using `${{ secrets.GITHUB_TOKEN }}` in a repository with package name `my-package`:
+
+```yaml
+name: Delete old container images
+
+on:
+  schedule:
+    - cron: '0 0 0 * *'  # the first day of the month
+
+jobs:
+  clean-ghcr:
+    name: Delete old unused container images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old images
+        uses: snok/container-retention-policy@v2
+        with:
+          image-names: my-package
+          cut-off: One month ago UTC
+          keep-at-least: 1
+          account-type: personal
+          token: ${{ secrets.GITHUB_TOKEN }}
+          token-type: github-token
+```
+
 # Parameters
 
 ## image-names
@@ -156,6 +181,9 @@ jobs:
 The names of the container images you want to delete old versions for. Takes one or several container image names as a
 comma separated list, and supports wildcards. The action will fetch all packages available, and filter
 down the list of packages to handle based on the image name input.
+
+If `token-type` is set to `github-token`, then this **MUST** be a single image and match the repository name from where
+this action is being used from.
 
 ## cut-off
 
@@ -209,6 +237,22 @@ with access to the container registry. Specifically, you need to grant it the fo
 - `read:packages`, and
 - `delete:packages`
 
+You can also pass in `${{ secrets.GITHUB_TOKEN }}`; however, please see `token-type`
+for more details.
+
+## token-type
+
+* **Required**: `No`
+* **Default**: `pat`
+* **Example**: `token: github-token`
+* **Valid choices**: `github-token` or `pat`
+
+The type of token being passed into `token`, which is used to authenticate to Github.
+
+Setting this to `github-token` is useful for pruning images from a workflow that lives
+in the same repository; however, the `image-names` parameter **MUST** be set to a single
+image, and that image **MUST** match the repository's package name.
+
 ## keep-at-least
 
 * **Required**: `No`
@@ -252,6 +296,13 @@ Supports Unix-shell style wildcards, i.e 'sha-*' to match all tags starting with
 * **Default**: `true`
 
 Whether to consider untagged images for deletion.
+
+## dry-run
+
+* **Required**: `No`
+* **Default**: `false`
+
+Prints output showing imaages which would be deleted but does not actually delete any images.
 
 # Outputs
 

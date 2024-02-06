@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from asyncio import Semaphore
+from asyncio import Semaphore, Task
 from datetime import datetime, timedelta
 from enum import Enum
 from fnmatch import fnmatch
@@ -13,7 +13,7 @@ from urllib.parse import quote_from_bytes
 
 from dateparser import parse
 from httpx import AsyncClient, TimeoutException
-from pydantic import BaseModel, conint, validator
+from pydantic import BaseModel, ValidationInfo, conint, field_validator
 
 if TYPE_CHECKING:
     from httpx import Response
@@ -41,6 +41,14 @@ class AccountType(str, Enum):
 
     ORG = 'org'
     PERSONAL = 'personal'
+
+
+class GithubTokenType(str, Enum):
+    """The type of token to use to authenticate to GitHub."""
+
+    GITHUB_TOKEN = 'github-token'
+    # Personal Access Token (PAT)
+    PAT = 'pat'
 
 
 deleted: list[str] = []
@@ -71,7 +79,7 @@ async def wait_for_rate_limit(*, response: Response, eligible_for_secondary_limi
 
     See docs on rate limits: https://docs.github.com/en/rest/rate-limit?apiVersion=2022-11-28.
     """
-    if int(response.headers['x-ratelimit-remaining']) == 0:
+    if int(response.headers.get('x-ratelimit-remaining', 1)) == 0:
         ratelimit_reset = datetime.fromtimestamp(int(response.headers['x-ratelimit-reset']))
         delta = ratelimit_reset - datetime.now()
 
@@ -87,8 +95,23 @@ async def wait_for_rate_limit(*, response: Response, eligible_for_secondary_limi
             await asyncio.sleep(delta.total_seconds())
 
     elif eligible_for_secondary_limit:
+        # https://docs.github.com/en/rest/overview/resources-in-the-rest-api?apiVersion=2022-11-28#secondary-rate-limits
         # https://docs.github.com/en/rest/guides/best-practices-for-integrators#dealing-with-secondary-rate-limits
-        await asyncio.sleep(1)
+        if int(response.headers.get('retry-after', 1)) == 0:
+            ratelimit_reset = datetime.fromtimestamp(int(response.headers['retry-after']))
+            delta = ratelimit_reset - datetime.now()
+            if delta > timedelta(seconds=MAX_SLEEP):
+                print(
+                    f'Rate limited for {delta} seconds. '
+                    f'Terminating workflow, since that\'s above the maximum allowed sleep time. '
+                    f'Retry the job manually, when the rate limit is refreshed.'
+                )
+                exit(1)
+            elif delta > timedelta(seconds=0):
+                print(f'Secondary Rate limit exceeded. Sleeping for {delta} seconds')
+                await asyncio.sleep(delta.total_seconds())
+        else:
+            await asyncio.sleep(1)
 
 
 async def get_all_pages(*, url: str, http_client: AsyncClient) -> list[dict]:
@@ -206,7 +229,12 @@ async def delete_package_version(
 
 
 async def delete_org_package_versions(
-    *, org_name: str, image_name: str, version_id: int, http_client: AsyncClient, semaphore: Semaphore
+    *,
+    org_name: str,
+    image_name: str,
+    version_id: int,
+    http_client: AsyncClient,
+    semaphore: Semaphore,
 ) -> None:
     """
     Delete an image version, for an organization.
@@ -219,7 +247,11 @@ async def delete_org_package_versions(
     """
     url = f'{BASE_URL}/orgs/{org_name}/packages/container/{encode_image_name(image_name)}/versions/{version_id}'
     await delete_package_version(
-        url=url, semaphore=semaphore, http_client=http_client, image_name=image_name, version_id=version_id
+        url=url,
+        semaphore=semaphore,
+        http_client=http_client,
+        image_name=image_name,
+        version_id=version_id,
     )
 
 
@@ -236,7 +268,11 @@ async def delete_package_versions(
     """
     url = f'{BASE_URL}/user/packages/container/{encode_image_name(image_name)}/versions/{version_id}'
     await delete_package_version(
-        url=url, semaphore=semaphore, http_client=http_client, image_name=image_name, version_id=version_id
+        url=url,
+        semaphore=semaphore,
+        http_client=http_client,
+        image_name=image_name,
+        version_id=version_id,
     )
 
 
@@ -256,7 +292,11 @@ class GithubAPI:
 
     @staticmethod
     async def list_package_versions(
-        *, account_type: AccountType, org_name: str | None, image_name: str, http_client: AsyncClient
+        *,
+        account_type: AccountType,
+        org_name: str | None,
+        image_name: str,
+        http_client: AsyncClient,
     ) -> list[PackageVersionResponse]:
         if account_type != AccountType.ORG:
             return await list_package_versions(image_name=image_name, http_client=http_client)
@@ -275,7 +315,10 @@ class GithubAPI:
     ) -> None:
         if account_type != AccountType.ORG:
             return await delete_package_versions(
-                image_name=image_name, version_id=version_id, http_client=http_client, semaphore=semaphore
+                image_name=image_name,
+                version_id=version_id,
+                http_client=http_client,
+                semaphore=semaphore,
             )
         assert isinstance(org_name, str)
         return await delete_org_package_versions(
@@ -288,22 +331,39 @@ class GithubAPI:
 
 
 class Inputs(BaseModel):
+    token_type: GithubTokenType = GithubTokenType.PAT
     image_names: list[str]
     cut_off: datetime
     timestamp_to_use: TimestampType
     account_type: AccountType
-    org_name: str | None
+    org_name: str | None = None
     untagged_only: bool
     skip_tags: list[str]
     keep_at_least: conint(ge=0) = 0  # type: ignore[valid-type]
     filter_tags: list[str]
     filter_include_untagged: bool = True
+    dry_run: bool = False
 
-    @validator('skip_tags', 'filter_tags', 'image_names', pre=True)
-    def parse_comma_separate_string_as_list(cls, v: str) -> list[str]:
+    @staticmethod
+    def _parse_comma_separate_string_as_list(v: str) -> list[str]:
         return [i.strip() for i in v.split(',')] if v else []
 
-    @validator('cut_off', pre=True)
+    @field_validator('skip_tags', 'filter_tags', mode='before')
+    def parse_comma_separate_string_as_list(cls, v: str) -> list[str]:
+        return cls._parse_comma_separate_string_as_list(v)
+
+    @field_validator('image_names', mode='before')
+    def validate_image_names(cls, v: str, values: ValidationInfo) -> list[str]:
+        images = cls._parse_comma_separate_string_as_list(v)
+        if 'token_type' in values.data:
+            token_type = values.data['token_type']
+            if token_type == GithubTokenType.GITHUB_TOKEN and len(images) != 1:
+                raise ValueError('A single image name is required if token_type is github-token')
+            if token_type == GithubTokenType.GITHUB_TOKEN and '*' in images[0]:
+                raise ValueError('Wildcards are not allowed if token_type is github-token')
+        return images
+
+    @field_validator('cut_off', mode='before')
     def parse_human_readable_datetime(cls, v: str) -> datetime:
         parsed_cutoff = parse(v)
         if not parsed_cutoff:
@@ -312,9 +372,9 @@ class Inputs(BaseModel):
             raise ValueError('Timezone is required for the cut-off')
         return parsed_cutoff
 
-    @validator('org_name', pre=True)
-    def validate_org_name(cls, v: str, values: dict) -> str | None:
-        if values['account_type'] == AccountType.ORG and not v:
+    @field_validator('org_name', mode='before')
+    def validate_org_name(cls, v: str, values: ValidationInfo) -> str | None:
+        if 'account_type' in values.data and values.data['account_type'] == AccountType.ORG and not v:
             raise ValueError('org-name is required when account-type is org')
         if v:
             return v
@@ -328,17 +388,21 @@ async def get_and_delete_old_versions(image_name: str, inputs: Inputs, http_clie
     This function contains more or less all our logic.
     """
     versions = await GithubAPI.list_package_versions(
-        account_type=inputs.account_type, org_name=inputs.org_name, image_name=image_name, http_client=http_client
+        account_type=inputs.account_type,
+        org_name=inputs.org_name,
+        image_name=image_name,
+        http_client=http_client,
     )
 
     # Define list of deletion-tasks to append to
-    tasks = []
+    tasks: list[Task] = []
+    simulated_tasks = 0
 
     # Iterate through dicts of image versions
     sem = Semaphore(50)
 
     async with sem:
-        for version in versions:
+        for idx, version in enumerate(versions):
             # Parse either the update-at timestamp, or the created-at timestamp
             # depending on which on the user has specified that we should use
             updated_or_created_at = getattr(version, inputs.timestamp_to_use.value)
@@ -371,6 +435,9 @@ async def get_and_delete_old_versions(image_name: str, inputs: Inputs, http_clie
                 # Skipping, because the filter_include_untagged setting is False
                 continue
 
+            # If we got here, most probably we will delete image.
+            # For pseudo-branching we set delete_image to true and
+            # handle cases with delete image by tag filtering in separate pseudo-branch
             delete_image = not inputs.filter_tags
             for filter_tag in inputs.filter_tags:
                 # One thing to note here is that we use fnmatch to support wildcards.
@@ -380,10 +447,22 @@ async def get_and_delete_old_versions(image_name: str, inputs: Inputs, http_clie
                     delete_image = True
                     break
 
+            if inputs.keep_at_least > 0:
+                if idx + 1 - (len(tasks) + simulated_tasks) > inputs.keep_at_least:
+                    delete_image = True
+                else:
+                    delete_image = False
+
+            # Here we will handle exclusion case
             for skip_tag in inputs.skip_tags:
                 if any(fnmatch(tag, skip_tag) for tag in image_tags):
                     # Skipping because this image version is tagged with a protected tag
                     delete_image = False
+
+            if delete_image is True and inputs.dry_run:
+                delete_image = False
+                simulated_tasks += 1
+                print(f'Would delete image {image_name}:{version.id}.')
 
             if delete_image:
                 tasks.append(
@@ -398,12 +477,6 @@ async def get_and_delete_old_versions(image_name: str, inputs: Inputs, http_clie
                         )
                     )
                 )
-
-    # Trim the version list to the n'th element we want to keep
-    if inputs.keep_at_least > 0:
-        for _i in range(0, min(inputs.keep_at_least, len(tasks))):
-            tasks[0].cancel()
-            tasks.remove(tasks[0])
 
     if not tasks:
         print(f'No more versions to delete for {image_name}')
@@ -460,6 +533,8 @@ async def main(
     keep_at_least: str,
     filter_tags: str,
     filter_include_untagged: str,
+    dry_run: str = 'false',
+    token_type: str = 'pat',
 ) -> None:
     """
     Delete old image versions.
@@ -486,6 +561,12 @@ async def main(
     :param filter_tags: Comma-separated list of tags to consider for deletion.
         Supports wildcard '*', '?', '[seq]' and '[!seq]' via Unix shell-style wildcards
     :param filter_include_untagged: Whether to consider untagged images for deletion.
+    :param dry_run: Do not actually delete packages but print output showing which packages would
+        have been deleted.
+    :param token_type: Token passed into 'token'. Must be 'pat' or 'github-token'. If
+                       'github-token' is used, then 'image_names` must be a single image,
+                       and the image matches the package name from the repository where
+                       this action is invoked.
     """
     inputs = Inputs(
         image_names=image_names,
@@ -498,17 +579,24 @@ async def main(
         keep_at_least=keep_at_least,
         filter_tags=filter_tags,
         filter_include_untagged=filter_include_untagged,
+        dry_run=dry_run,
+        token_type=token_type,
     )
     async with AsyncClient(
         headers={'accept': 'application/vnd.github.v3+json', 'Authorization': f'Bearer {token}'}
     ) as client:
-        # Get all packages from the user or orgs account
-        all_packages = await GithubAPI.list_packages(
-            account_type=inputs.account_type, org_name=inputs.org_name, http_client=client
-        )
+        if inputs.token_type == GithubTokenType.GITHUB_TOKEN:
+            packages_to_delete_from = set(inputs.image_names)
+        else:
+            # Get all packages from the user or orgs account
+            all_packages = await GithubAPI.list_packages(
+                account_type=inputs.account_type,
+                org_name=inputs.org_name,
+                http_client=client,
+            )
 
-        # Filter existing image names by action inputs
-        packages_to_delete_from = filter_image_names(all_packages, inputs.image_names)
+            # Filter existing image names by action inputs
+            packages_to_delete_from = filter_image_names(all_packages, inputs.image_names)
 
         # Create tasks to run concurrently
         tasks = [

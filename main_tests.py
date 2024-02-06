@@ -4,7 +4,7 @@ import tempfile
 from asyncio import Semaphore
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest as pytest
 from httpx import AsyncClient
@@ -154,7 +154,9 @@ input_defaults = {
     'filter_tags': '',
     'filter_include_untagged': 'true',
     'token': 'test',
+    'token_type': 'pat',
     'account_type': 'personal',
+    'dry_run': 'false',
 }
 
 
@@ -244,6 +246,13 @@ class TestGetAndDeleteOldVersions:
         )
     ]
 
+    @staticmethod
+    def generate_fresh_valid_data_with_id(id):
+        r = deepcopy(TestGetAndDeleteOldVersions.valid_data[0])
+        r.id = id
+        r.created_at = datetime.now(timezone(timedelta()))
+        return r
+
     async def test_delete_package(self, mocker, capsys, http_client):
         # Mock the list function
         mocker.patch.object(main.GithubAPI, 'list_package_versions', return_value=self.valid_data)
@@ -262,6 +271,15 @@ class TestGetAndDeleteOldVersions:
         await get_and_delete_old_versions(image_name='a', inputs=inputs, http_client=http_client)
         captured = capsys.readouterr()
         assert captured.out == 'No more versions to delete for a\n'
+
+    async def test_keep_at_least_deletes_not_only_marked(self, mocker, capsys, http_client):
+        data = [self.generate_fresh_valid_data_with_id(id) for id in range(3)]
+        data.append(self.valid_data[0])
+        mocker.patch.object(main.GithubAPI, 'list_package_versions', return_value=data)
+        inputs = _create_inputs_model(keep_at_least=2)
+        await get_and_delete_old_versions(image_name='a', inputs=inputs, http_client=http_client)
+        captured = capsys.readouterr()
+        assert captured.out == 'Deleted old image: a:1234567\n'
 
     async def test_not_beyond_cutoff(self, mocker, capsys, http_client):
         response_data = [
@@ -344,12 +362,38 @@ class TestGetAndDeleteOldVersions:
         captured = capsys.readouterr()
         assert captured.out == 'Deleted old image: a:1234567\n'
 
+    async def test_dry_run(self, mocker, capsys, http_client):
+        data = deepcopy(self.valid_data)
+        data[0].metadata = MetadataModel(
+            **{'container': {'tags': ['sha-deadbeef', 'edge']}, 'package_type': 'container'}
+        )
+        mocker.patch.object(main.GithubAPI, 'list_package_versions', return_value=data)
+        mock_delete_package = mocker.patch.object(main.GithubAPI, 'delete_package')
+        inputs = _create_inputs_model(dry_run='true')
+        await get_and_delete_old_versions(image_name='a', inputs=inputs, http_client=http_client)
+        captured = capsys.readouterr()
+        assert captured.out == 'Would delete image a:1234567.\nNo more versions to delete for a\n'
+        mock_delete_package.assert_not_called()
+
+
+def test_inputs_bad_token_type():
+    with pytest.raises(ValidationError, match='Input should be \'github-token\' or \'pat\''):
+        _create_inputs_model(token_type='undefined-token-type', image_names='a,b')
+
+
+def test_inputs_token_type_as_github_token_with_bad_image_names():
+    _create_inputs_model(image_names='a', token_type='github-token')
+    with pytest.raises(ValidationError, match='Wildcards are not allowed if token_type is github-token'):
+        _create_inputs_model(image_names='a*', token_type='github-token')
+    with pytest.raises(ValidationError, match='A single image name is required if token_type is github-token'):
+        _create_inputs_model(image_names='a,b,c', token_type='github-token')
+
 
 def test_inputs_bad_account_type():
     # Account type
     _create_inputs_model(account_type='personal')
-    _create_inputs_model(account_type='org')
-    with pytest.raises(ValidationError, match='is not a valid enumeration member'):
+    _create_inputs_model(account_type='org', org_name='myorg')
+    with pytest.raises(ValidationError, match='Input should be \'org\' or \'personal\''):
         _create_inputs_model(account_type='')
 
     # Org name
@@ -360,7 +404,7 @@ def test_inputs_bad_account_type():
     # Timestamp type
     _create_inputs_model(timestamp_to_use='updated_at')
     _create_inputs_model(timestamp_to_use='created_at')
-    with pytest.raises(ValueError, match=' value is not a valid enumeration mem'):
+    with pytest.raises(ValueError, match='Input should be \'updated_at\' or \'created_at\''):
         _create_inputs_model(timestamp_to_use='wat')
 
     # Cut-off
@@ -384,7 +428,7 @@ def test_inputs_bad_account_type():
     assert _create_inputs_model(skip_tags='a , b  ,c').skip_tags == ['a', 'b', 'c']
 
     # Keep at least
-    with pytest.raises(ValueError, match='ensure this value is greater than or equal to 0'):
+    with pytest.raises(ValueError, match='Input should be greater than or equal to 0'):
         _create_inputs_model(keep_at_least='-1')
 
     # Filter tags
@@ -441,6 +485,34 @@ async def test_main(mocker, ok_response):
             'token': 'test',
         }
     )
+
+
+async def test_main_with_token_type_github_token(mocker, ok_response):
+    mock_list_package = mocker.patch.object(main.GithubAPI, 'list_packages')
+    mock_filter_image_names = mocker.patch.object(main, 'filter_image_names')
+    mock_get_and_delete_old_versions = mocker.patch.object(main, 'get_and_delete_old_versions')
+    mocker.patch.object(AsyncClient, 'get', return_value=ok_response)
+    mocker.patch.object(AsyncClient, 'delete', return_value=ok_response)
+    await main_(
+        **{
+            'account_type': 'org',
+            'org_name': 'test',
+            'image_names': 'my-package',
+            'timestamp_to_use': 'updated_at',
+            'cut_off': '2 hours ago UTC',
+            'untagged_only': 'false',
+            'skip_tags': '',
+            'keep_at_least': '0',
+            'filter_tags': '',
+            'filter_include_untagged': 'true',
+            'token': 'test',
+            'token_type': 'github-token',
+        }
+    )
+
+    mock_list_package.assert_not_called()
+    mock_filter_image_names.assert_not_called()
+    mock_get_and_delete_old_versions.assert_called_with('my-package', ANY, ANY)
 
 
 async def test_public_images_with_more_than_5000_downloads(mocker, capsys):
