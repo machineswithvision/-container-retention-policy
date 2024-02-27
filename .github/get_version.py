@@ -10,9 +10,9 @@ import sys
 from packaging import version
 
 if __name__ == '__main__':
-    ref = sys.argv[1]  # ref will usually look like refs/tags/v1.0.1
+    ref = sys.argv[1]  # ref will usually look like v1.0.1
     major = sys.argv[2] == 'major'
-    version = version.parse(ref.split('refs/tags/v')[1])
+    version = version.parse(ref)
 
     if major:
         print(f'v{version.major}')
