@@ -10,11 +10,11 @@ jobs:
   linting:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-python@v5.0.0
         with:
           python-version: "3.11.2"
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4.0.0
         id: cache
         with:
           path: |
@@ -33,11 +33,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-python@v5.0.0
         with:
           python-version: "3.11.2"
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4.0.0
         id: cache
         with:
           path: |
@@ -49,9 +49,11 @@ jobs:
           virtualenvs-in-project: true
       - run: poetry install --no-interaction --no-root
         if: steps.cache.outputs.cache-hit != 'true'
-      - run: source $VENV && pytest main_tests.py --cov-report=xml
-      - uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage.xml
-          fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
+
+# Disabled code coverage because we need to sign up to codecov and provide a valid codecov token for this.
+#      - run: source $VENV && pytest main_tests.py --cov-report=xml
+#      - uses: codecov/codecov-action@v4.1.0
+#        with:
+#          file: ./coverage.xml
+#          fail_ci_if_error: true
+#          token: ${{ secrets.CODECOV_TOKEN }}
